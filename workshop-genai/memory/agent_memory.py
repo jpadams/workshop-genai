@@ -51,6 +51,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from neo4j import GraphDatabase
+from neo4j.graph import Node
 from neo4j_graphrag.embeddings.openai import OpenAIEmbeddings
 from neo4j_graphrag.retrievers import VectorCypherRetriever
 from neo4j_graphrag.llm import OpenAILLM
@@ -86,6 +87,8 @@ MATCH (node)-[:FROM_DOCUMENT]->(d)-[:PDF_OF]->(lesson)
 RETURN
     node.text as text, score,
     lesson.url as lesson_url,
+    elementId(node) AS _chunkId,
+    elementId(lesson) AS _lessonId,
     collect {
         MATCH (node)<-[:FROM_CHUNK]-(entity)-[r]->(other)-[:FROM_CHUNK]->()
         WITH toStringList([
@@ -158,18 +161,52 @@ current_recorder: contextvars.ContextVar[StreamingTraceRecorder | None] = (
 )
 
 
-async def _record_search(tool_name: str, query: str, result) -> None:
-    """Record a graph search into the active reasoning trace (if any)."""
+# tag::link_retrieved[]
+# Link the lesson-graph nodes a tool actually touched to the ToolCall that
+# fetched them: (:ToolCall)-[:RETRIEVED]->(dataNode). This stitches the memory
+# graph and the lesson graph into a single connected context graph.
+_LINK_RETRIEVED = """
+MATCH (tc:ToolCall {id: $tcid})
+UNWIND $ids AS nid
+MATCH (n) WHERE elementId(n) = nid
+MERGE (tc)-[:RETRIEVED]->(n)
+"""
+
+
+def _collect_node_ids(value, out: set) -> None:
+    """Recursively collect elementIds of any neo4j Node found in a result value."""
+    if isinstance(value, Node):
+        out.add(value.element_id)
+    elif isinstance(value, dict):
+        for v in value.values():
+            _collect_node_ids(v, out)
+    elif isinstance(value, (list, tuple, set)):
+        for v in value:
+            _collect_node_ids(v, out)
+
+
+async def _record_search(tool_name: str, query: str, result, touched_ids=None) -> None:
+    """Record a graph search into the active reasoning trace (if any) and link
+    any retrieved lesson-graph nodes to the resulting ToolCall."""
     recorder = current_recorder.get()
     if recorder is None:
         return
-    await recorder.record_tool_call(
+    tool_call = await recorder.record_tool_call(
         tool_name,
         {"query": query},
         result=str(result)[:1000],
         status=ToolCallStatus.SUCCESS,
         auto_observation=True,
     )
+    ids = [i for i in (touched_ids or []) if i][:20]
+    if ids:
+        driver.execute_query(
+            _LINK_RETRIEVED,
+            tcid=str(tool_call.id),
+            ids=ids,
+            database_=os.getenv("NEO4J_DATABASE"),
+        )
+# end::link_retrieved[]
 
 
 # Define the agent's tools. They are async so they can await the reasoning
@@ -190,12 +227,17 @@ async def get_schema():
 @tool("Search-lesson-content")
 async def search_lessons(query: str):
     """Search for lesson content related to the query."""
-    result = vector_retriever.search(
-        query_text=query,
-        top_k=5
-    )
-    context = [item.content for item in result.items]
-    await _record_search("Search-lesson-content", query, context)
+    # Use get_search_results so we can see the raw records: this gives us both
+    # the text for the agent AND the elementIds of the chunk/lesson nodes hit.
+    raw = vector_retriever.get_search_results(query_text=query, top_k=5)
+    context, touched_ids = [], []
+    for record in raw.records:
+        context.append(
+            f"{record['text']}\n(lesson: {record['lesson_url']})\n"
+            f"related: {' | '.join(record['associated_entities'])}"
+        )
+        touched_ids += [record.get("_chunkId"), record.get("_lessonId")]
+    await _record_search("Search-lesson-content", query, context, touched_ids)
     return context
 
 
@@ -203,7 +245,12 @@ async def search_lessons(query: str):
 async def query_database(query: str):
     """A catchall tool to get answers to specific questions about lesson content."""
     result = text2cypher_retriever.get_search_results(query)
-    await _record_search("Query-database", query, result)
+    # Capture any actual graph nodes the generated Cypher returned.
+    touched_ids: set = set()
+    for record in result.records:
+        for value in record.values():
+            _collect_node_ids(value, touched_ids)
+    await _record_search("Query-database", query, result, list(touched_ids))
     return result
 
 

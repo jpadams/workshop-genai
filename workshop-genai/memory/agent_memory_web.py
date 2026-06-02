@@ -68,7 +68,11 @@ app = FastAPI(title="Agent Memory Chat", lifespan=lifespan)
 # Context-graph visualization
 # ---------------------------------------------------------------------------
 
-# Colors keyed by primary node label (Neo4j-browser-ish palette).
+import colorsys
+import hashlib
+
+# Fixed colors for the memory labels (Neo4j-browser-ish palette). Lesson-graph
+# labels get a stable color derived from the label name (see _color_for).
 _NODE_COLORS = {
     "Conversation": "#F79767",
     "Message": "#57C7E3",
@@ -80,25 +84,44 @@ _NODE_COLORS = {
     "Tool": "#FFC454",
 }
 
-# A label-agnostic caption that never returns embedding vectors.
-_CAP = (
-    "left(coalesce(toString({n}.name), toString({n}.task), toString({n}.tool_name), "
-    "toString({n}.action), toString({n}.thought), toString({n}.content), "
-    "toString({n}.session_id), labels({n})[0]), 60)"
-)
+# Labels the KG builder adds to every node; we hide them when picking a caption.
+_HIDDEN_LABELS = "['__KGBuilder__', '__Entity__', '__Node__']"
+
+
+def _lbl(v: str) -> str:
+    """Cypher fragment: the first meaningful label of node variable ``v``."""
+    return f"head([l IN labels({v}) WHERE NOT l IN {_HIDDEN_LABELS}] + labels({v}) + ['Node'])"
+
+
+def _cap(v: str) -> str:
+    """Cypher fragment: a short caption for node ``v`` that never ships embeddings."""
+    fields = ["name", "title", "url", "task", "tool_name", "action",
+              "thought", "content", "text", "session_id"]
+    inner = ", ".join(f"toString({v}.{f})" for f in fields)
+    return f"left(coalesce({inner}, {_lbl(v)}), 60)"
+
+
+def _color_for(label: str) -> str:
+    """Stable color per label: fixed for memory labels, hashed hue otherwise."""
+    if label in _NODE_COLORS:
+        return _NODE_COLORS[label]
+    hue = int(hashlib.md5(label.encode()).hexdigest(), 16) % 360
+    r, g, b = colorsys.hls_to_rgb(hue / 360, 0.62, 0.55)
+    return "#%02x%02x%02x" % (int(r * 255), int(g * 255), int(b * 255))
 
 
 def _branch(match: str) -> str:
     """Build one UNION branch returning the (s)-[r]->(e) triple for the canvas."""
     return f"""
 {match}
-RETURN elementId(s) AS s_id, labels(s)[0] AS s_label, {_CAP.format(n='s')} AS s_cap,
+RETURN elementId(s) AS s_id, {_lbl('s')} AS s_label, {_cap('s')} AS s_cap,
        elementId(r) AS r_id, type(r) AS r_type,
-       elementId(e) AS e_id, labels(e)[0] AS e_label, {_CAP.format(n='e')} AS e_cap
+       elementId(e) AS e_id, {_lbl('e')} AS e_label, {_cap('e')} AS e_cap
 """
 
 
-# Every relationship shape the memory layer creates for a session.
+# Every relationship shape that makes up a session's context graph — including
+# the RETRIEVED edge from a ToolCall to the lesson-graph nodes it fetched.
 _VIZ_QUERY = "\nUNION\n".join(
     _branch(m)
     for m in [
@@ -109,8 +132,29 @@ _VIZ_QUERY = "\nUNION\n".join(
         "MATCH (:ReasoningTrace {session_id:$sid})-[:HAS_STEP]->(s:ReasoningStep)-[r:USES_TOOL]->(e:ToolCall)",
         "MATCH (:ReasoningTrace {session_id:$sid})-[:HAS_STEP]->(:ReasoningStep)"
         "-[:USES_TOOL]->(s:ToolCall)-[r:INSTANCE_OF]->(e:Tool)",
+        "MATCH (:ReasoningTrace {session_id:$sid})-[:HAS_STEP]->(:ReasoningStep)"
+        "-[:USES_TOOL]->(s:ToolCall)-[r:RETRIEVED]->(e)",
     ]
 )
+
+# Direction-agnostic 1-hop neighborhood of a node, for double-click expand.
+_EXPAND_QUERY = f"""
+MATCH (n) WHERE elementId(n) = $id
+MATCH (n)-[r]-(m)
+WITH n, r, m LIMIT 60
+RETURN elementId(n) AS n_id, {_lbl('n')} AS n_label, {_cap('n')} AS n_cap,
+       elementId(r) AS r_id, type(r) AS r_type, startNode(r) = n AS n_is_start,
+       elementId(m) AS m_id, {_lbl('m')} AS m_label, {_cap('m')} AS m_cap
+"""
+
+
+def _node(nid: str, label: str, cap: str) -> dict:
+    return {
+        "id": nid,
+        "caption": f"{label}: {cap}" if cap and cap != label else (label or "Node"),
+        "label": label or "Node",
+        "color": _color_for(label or "Node"),
+    }
 
 
 def build_context_viz(session_id: str) -> dict:
@@ -119,25 +163,47 @@ def build_context_viz(session_id: str) -> dict:
         _VIZ_QUERY, sid=session_id, database_=os.getenv("NEO4J_DATABASE")
     )
     nodes: dict[str, dict] = {}
-    rels: list[dict] = []
+    rels: dict[str, dict] = {}
     for row in records:
-        for prefix in ("s", "e"):
-            nid = row[f"{prefix}_id"]
-            label = row[f"{prefix}_label"]
-            cap = row[f"{prefix}_cap"]
-            nodes[nid] = {
-                "id": nid,
-                "caption": f"{label}: {cap}" if cap and cap != label else label,
-                "label": label,
-                "color": _NODE_COLORS.get(label, "#CCCCCC"),
-            }
-        rels.append({
-            "id": row["r_id"],
-            "from": row["s_id"],
-            "to": row["e_id"],
-            "caption": row["r_type"],
-        })
-    return {"nodes": list(nodes.values()), "relationships": rels}
+        nodes[row["s_id"]] = _node(row["s_id"], row["s_label"], row["s_cap"])
+        nodes[row["e_id"]] = _node(row["e_id"], row["e_label"], row["e_cap"])
+        rels[row["r_id"]] = {
+            "id": row["r_id"], "from": row["s_id"], "to": row["e_id"], "caption": row["r_type"],
+        }
+    return {"nodes": list(nodes.values()), "relationships": list(rels.values())}
+
+
+def expand_node_viz(element_id: str) -> dict:
+    """Return the 1-hop neighborhood of a node (any label) in NVL shape."""
+    records, _, _ = am.driver.execute_query(
+        _EXPAND_QUERY, id=element_id, database_=os.getenv("NEO4J_DATABASE")
+    )
+    nodes: dict[str, dict] = {}
+    rels: dict[str, dict] = {}
+    for row in records:
+        nodes[row["n_id"]] = _node(row["n_id"], row["n_label"], row["n_cap"])
+        nodes[row["m_id"]] = _node(row["m_id"], row["m_label"], row["m_cap"])
+        frm, to = (row["n_id"], row["m_id"]) if row["n_is_start"] else (row["m_id"], row["n_id"])
+        rels[row["r_id"]] = {"id": row["r_id"], "from": frm, "to": to, "caption": row["r_type"]}
+    return {"nodes": list(nodes.values()), "relationships": list(rels.values())}
+
+
+def node_details(element_id: str) -> dict:
+    """Return a node's label + display-safe properties (no embeddings/huge text)."""
+    records, _, _ = am.driver.execute_query(
+        f"MATCH (n) WHERE elementId(n) = $id "
+        f"RETURN {_lbl('n')} AS label, labels(n) AS labels, properties(n) AS props",
+        id=element_id, database_=os.getenv("NEO4J_DATABASE"),
+    )
+    if not records:
+        return {"id": element_id, "label": None, "labels": [], "properties": {}}
+    row = records[0]
+    props = {}
+    for k, v in (row["props"] or {}).items():
+        if k == "embedding" or (isinstance(v, list) and v and isinstance(v[0], (int, float))):
+            continue  # skip embedding vectors
+        props[k] = (v[:500] + "…") if isinstance(v, str) and len(v) > 500 else v
+    return {"id": element_id, "label": row["label"], "labels": row["labels"], "properties": props}
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +260,18 @@ async def chat_history(conversationId: str):
 @app.get("/graph/context")
 async def graph_context(conversationId: str):
     return build_context_viz(conversationId)
+
+
+@app.get("/graph/expand")
+async def graph_expand(id: str):
+    """Neighbors of a node (memory or lesson-graph) for double-click expand."""
+    return expand_node_viz(id)
+
+
+@app.get("/graph/node")
+async def graph_node(id: str):
+    """A node's properties for the click-for-info panel."""
+    return node_details(id)
 
 
 @app.post("/chat/feedback")

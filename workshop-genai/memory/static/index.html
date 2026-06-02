@@ -19,6 +19,15 @@
   #graph .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:3px; vertical-align:middle; }
   #fallback { position:absolute; inset:0; overflow:auto; padding:12px; font-size:12px; color:var(--muted); display:none; }
   #fallback ul { margin:4px 0; padding-left:18px; }
+  #hint { position:absolute; bottom:8px; left:8px; z-index:5; font-size:10.5px; color:var(--muted); background:rgba(0,0,0,.35); padding:4px 8px; border-radius:6px; }
+  #info { position:absolute; top:8px; right:8px; z-index:6; width:300px; max-height:calc(100% - 16px); overflow:auto;
+          background:#2a2e37; border:1px solid #000; border-radius:8px; padding:10px 12px; font-size:12px; display:none; box-shadow:0 4px 16px rgba(0,0,0,.4); }
+  #info .ttl { font-weight:600; margin-bottom:6px; display:flex; align-items:center; gap:6px; }
+  #info .dot { width:10px; height:10px; border-radius:50%; display:inline-block; }
+  #info .x { margin-left:auto; cursor:pointer; color:var(--muted); border:0; background:none; font-size:14px; }
+  #info table { width:100%; border-collapse:collapse; }
+  #info td { vertical-align:top; padding:2px 4px; border-top:1px solid #000; word-break:break-word; }
+  #info td.k { color:var(--muted); white-space:nowrap; }
   #chat { flex: 1 1 45%; display:flex; flex-direction:column; border-top:2px solid #000; min-height:200px; }
   #messages { flex:1; overflow:auto; padding:14px 16px; }
   .msg { margin-bottom:14px; max-width:80%; }
@@ -46,6 +55,8 @@
 
   <div id="graph">
     <div class="legend" id="legend"></div>
+    <div id="info"></div>
+    <div id="hint">scroll = zoom · drag background = pan · drag node = move · click = info · double-click = expand</div>
     <div id="fallback"></div>
   </div>
 
@@ -59,20 +70,22 @@
 </div>
 
 <script type="module">
-const COLORS = { Conversation:"#F79767", Message:"#57C7E3", Entity:"#8DCC93",
-  Preference:"#D9C8AE", ReasoningTrace:"#ECB5C9", ReasoningStep:"#C990C0",
-  ToolCall:"#4C8EDA", Tool:"#FFC454" };
+// Node colors come from the backend (memory labels fixed, lesson-graph labels
+// hashed), so the legend always matches what's drawn.
 
-// Try to load Neo4j Visualization Library (same lib ford-agent uses). If the
-// CDN/module is unavailable, we fall back to a readable text view of the graph.
-let NVL = null;
+// Try to load Neo4j Visualization Library (same lib ford-agent uses) plus its
+// interaction handlers. If the CDN/module is unavailable, we fall back to a
+// readable text view of the graph.
+let NVL = null, Handlers = null;
 try {
   ({ NVL } = await import("https://esm.sh/@neo4j-nvl/base@0.3.6"));
+  Handlers = await import("https://esm.sh/@neo4j-nvl/interaction-handlers@0.3.6");
 } catch (e) {
   console.warn("NVL unavailable, using text fallback:", e);
 }
 
 let nvl = null;
+let knownNodes = new Set();   // track which node ids are already on the canvas
 let conversationId = localStorage.getItem("conversationId") || null;
 
 const $ = (id) => document.getElementById(id);
@@ -86,31 +99,90 @@ function setConv(id) {
   $("convId").textContent = id;
 }
 
-function renderLegend(nodes) {
-  const labels = [...new Set(nodes.map(n => n.label))];
-  $("legend").innerHTML = labels.map(l =>
-    `<span><i style="background:${COLORS[l]||'#ccc'}"></i>${l}</span>`).join("");
+// Build the legend from the colors the backend actually assigned to each label.
+const legendColors = {};
+function renderLegend() {
+  $("legend").innerHTML = Object.entries(legendColors).map(([l, c]) =>
+    `<span><i style="background:${c}"></i>${l}</span>`).join("");
 }
 
-function renderGraph(viz) {
+function toNvl(nodes, rels) {
+  for (const n of nodes) if (!(n.label in legendColors)) legendColors[n.label] = n.color;
+  return [
+    nodes.map(n => ({ id:n.id, caption:n.caption, color:n.color, size:18 })),
+    rels.map(r => ({ id:r.id, from:r.from, to:r.to, caption:r.caption })),
+  ];
+}
+
+function showInfo(node) {
+  const el = $("info");
+  el.style.display = "block";
+  el.innerHTML = `<div class="ttl"><span class="dot" style="background:${COLORS_FALLBACK(node)}"></span>
+    <span>${node.caption || node.id}</span><button class="x">✕</button></div><div class="body">…</div>`;
+  el.querySelector(".x").onclick = () => { el.style.display = "none"; };
+  fetch(`/graph/node?id=${encodeURIComponent(node.id)}`).then(r => r.json()).then(d => {
+    const rows = Object.entries(d.properties || {}).map(([k, v]) =>
+      `<tr><td class="k">${k}</td><td>${String(v)}</td></tr>`).join("");
+    el.querySelector(".body").innerHTML =
+      `<div style="color:var(--muted);margin-bottom:6px">${(d.labels||[]).join(" · ")}</div>` +
+      `<table>${rows || '<tr><td>(no properties)</td></tr>'}</table>` +
+      `<div style="margin-top:8px;color:var(--muted)">double-click the node to expand its neighbors</div>`;
+  }).catch(() => {});
+}
+const COLORS_FALLBACK = (node) => legendColors[node.label] || "#ccc";
+
+async function expand(nodeId) {
+  try {
+    const viz = await (await fetch(`/graph/expand?id=${encodeURIComponent(nodeId)}`)).json();
+    addToGraph(viz);
+  } catch (e) { console.warn("expand failed", e); }
+}
+
+function makeNvl(nodes, rels) {
+  const [nvlNodes, nvlRels] = toNvl(nodes, rels);
+  nvl = new NVL(graphEl, nvlNodes, nvlRels,
+    { initialZoom: 0.7, layout: "forceDirected" },
+    { onError: (err) => console.warn("NVL:", err) });
+  nodes.forEach(n => knownNodes.add(n.id));
+  // Interactivity: zoom (scroll), pan (drag bg), move nodes (drag), click + dbl-click.
+  new Handlers.ZoomInteraction(nvl);
+  new Handlers.PanInteraction(nvl);
+  new Handlers.DragNodeInteraction(nvl);
+  const click = new Handlers.ClickInteraction(nvl);
+  click.updateCallback("onNodeClick", (node) => showInfo(node));
+  click.updateCallback("onNodeDoubleClick", (node) => expand(node.id));
+  click.updateCallback("onCanvasClick", () => { $("info").style.display = "none"; });
+}
+
+// Add/update elements without resetting the view (keeps positions, zoom, pan).
+function addToGraph(viz) {
   const nodes = viz.nodes || [];
   const rels = viz.relationships || [];
-  renderLegend(nodes);
-  if (NVL) {
+  if (NVL && Handlers) {
     try {
       fallbackEl.style.display = "none";
-      const nvlNodes = nodes.map(n => ({ id:n.id, caption:n.caption, color:n.color, size:18 }));
-      const nvlRels = rels.map(r => ({ id:r.id, from:r.from, to:r.to, caption:r.caption }));
-      if (nvl) nvl.destroy();
-      nvl = new NVL(graphEl, nvlNodes, nvlRels,
-        { initialZoom: 0.7, layout: "forceDirected" },
-        { onError: (err) => console.warn("NVL:", err) });
+      const [nvlNodes, nvlRels] = toNvl(nodes, rels);
+      if (!nvl) { makeNvl(nodes, rels); }
+      else { nvl.addAndUpdateElementsInGraph(nvlNodes, nvlRels); nodes.forEach(n => knownNodes.add(n.id)); }
+      renderLegend();
       return;
     } catch (e) { console.warn("NVL render failed, text fallback:", e); }
   }
-  // Text fallback
+  renderFallback(nodes, rels);
+}
+
+// Full (re)render — used on load and New conversation.
+function renderGraph(viz) {
+  if (NVL && Handlers && nvl) { try { nvl.destroy(); } catch (e) {} nvl = null; }
+  knownNodes = new Set();
+  Object.keys(legendColors).forEach(k => delete legendColors[k]);
+  addToGraph(viz);
+}
+
+function renderFallback(nodes, rels) {
   fallbackEl.style.display = "block";
   const byId = Object.fromEntries(nodes.map(n => [n.id, n.caption]));
+  renderLegend();
   fallbackEl.innerHTML =
     `<b>Context graph</b> — ${nodes.length} nodes, ${rels.length} relationships` +
     `<ul>` + rels.map(r =>
@@ -162,7 +234,7 @@ async function send() {
     setConv(data.conversationId);
     thinking.remove();
     addMessage("assistant", data.reply);
-    renderGraph(data.viz);
+    addToGraph(data.viz);
   } catch (e) {
     thinking.querySelector(".bubble").textContent = "Error: " + e;
   } finally {
