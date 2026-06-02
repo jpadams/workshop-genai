@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Memory Chat</title>
+<style>
+  :root { --bg:#1b1d23; --panel:#23262e; --accent:#4C8EDA; --text:#e6e6e6; --muted:#9aa0aa; }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; font-family: system-ui, sans-serif; background: var(--bg); color: var(--text); }
+  #app { display: flex; flex-direction: column; height: 100vh; }
+  header { display:flex; align-items:center; gap:12px; padding:10px 16px; background:var(--panel); border-bottom:1px solid #000; }
+  header h1 { font-size: 15px; margin:0; font-weight:600; }
+  header .conv { color:var(--muted); font-size:12px; font-family:monospace; }
+  header button { margin-left:auto; background:var(--accent); color:#fff; border:0; border-radius:6px; padding:6px 12px; cursor:pointer; font-size:13px; }
+  #graph { flex: 1 1 55%; position:relative; background:#15171c; min-height:200px; }
+  #graph .legend { position:absolute; top:8px; left:8px; z-index:5; font-size:11px; color:var(--muted); background:rgba(0,0,0,.35); padding:6px 8px; border-radius:6px; }
+  #graph .legend span { display:inline-block; margin-right:8px; }
+  #graph .legend i { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:3px; vertical-align:middle; }
+  #fallback { position:absolute; inset:0; overflow:auto; padding:12px; font-size:12px; color:var(--muted); display:none; }
+  #fallback ul { margin:4px 0; padding-left:18px; }
+  #chat { flex: 1 1 45%; display:flex; flex-direction:column; border-top:2px solid #000; min-height:200px; }
+  #messages { flex:1; overflow:auto; padding:14px 16px; }
+  .msg { margin-bottom:14px; max-width:80%; }
+  .msg.user { margin-left:auto; }
+  .bubble { padding:10px 12px; border-radius:10px; white-space:pre-wrap; line-height:1.4; }
+  .msg.user .bubble { background:var(--accent); color:#fff; }
+  .msg.assistant .bubble { background:var(--panel); }
+  .role { font-size:11px; color:var(--muted); margin-bottom:3px; }
+  .fb { margin-top:5px; font-size:14px; }
+  .fb button { background:none; border:0; cursor:pointer; font-size:15px; opacity:.6; }
+  .fb button:hover, .fb button.on { opacity:1; }
+  #inputRow { display:flex; gap:8px; padding:12px 16px; background:var(--panel); border-top:1px solid #000; }
+  #inputRow textarea { flex:1; resize:none; height:46px; border-radius:8px; border:1px solid #000; background:#15171c; color:var(--text); padding:10px; font-family:inherit; font-size:14px; }
+  #inputRow button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:0 18px; cursor:pointer; font-weight:600; }
+  #inputRow button:disabled { opacity:.5; cursor:default; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <h1>🧠 Agent Memory Chat</h1>
+    <span class="conv" id="convId">—</span>
+    <button id="newBtn">New conversation</button>
+  </header>
+
+  <div id="graph">
+    <div class="legend" id="legend"></div>
+    <div id="fallback"></div>
+  </div>
+
+  <div id="chat">
+    <div id="messages"></div>
+    <div id="inputRow">
+      <textarea id="input" placeholder="Ask about the lessons…  (Enter to send, Shift+Enter = newline)"></textarea>
+      <button id="sendBtn">Send</button>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+const COLORS = { Conversation:"#F79767", Message:"#57C7E3", Entity:"#8DCC93",
+  Preference:"#D9C8AE", ReasoningTrace:"#ECB5C9", ReasoningStep:"#C990C0",
+  ToolCall:"#4C8EDA", Tool:"#FFC454" };
+
+// Try to load Neo4j Visualization Library (same lib ford-agent uses). If the
+// CDN/module is unavailable, we fall back to a readable text view of the graph.
+let NVL = null;
+try {
+  ({ NVL } = await import("https://esm.sh/@neo4j-nvl/base@0.3.6"));
+} catch (e) {
+  console.warn("NVL unavailable, using text fallback:", e);
+}
+
+let nvl = null;
+let conversationId = localStorage.getItem("conversationId") || null;
+
+const $ = (id) => document.getElementById(id);
+const messagesEl = $("messages");
+const graphEl = $("graph");
+const fallbackEl = $("fallback");
+
+function setConv(id) {
+  conversationId = id;
+  localStorage.setItem("conversationId", id);
+  $("convId").textContent = id;
+}
+
+function renderLegend(nodes) {
+  const labels = [...new Set(nodes.map(n => n.label))];
+  $("legend").innerHTML = labels.map(l =>
+    `<span><i style="background:${COLORS[l]||'#ccc'}"></i>${l}</span>`).join("");
+}
+
+function renderGraph(viz) {
+  const nodes = viz.nodes || [];
+  const rels = viz.relationships || [];
+  renderLegend(nodes);
+  if (NVL) {
+    try {
+      fallbackEl.style.display = "none";
+      const nvlNodes = nodes.map(n => ({ id:n.id, caption:n.caption, color:n.color, size:18 }));
+      const nvlRels = rels.map(r => ({ id:r.id, from:r.from, to:r.to, caption:r.caption }));
+      if (nvl) nvl.destroy();
+      nvl = new NVL(graphEl, nvlNodes, nvlRels,
+        { initialZoom: 0.7, layout: "forceDirected" },
+        { onError: (err) => console.warn("NVL:", err) });
+      return;
+    } catch (e) { console.warn("NVL render failed, text fallback:", e); }
+  }
+  // Text fallback
+  fallbackEl.style.display = "block";
+  const byId = Object.fromEntries(nodes.map(n => [n.id, n.caption]));
+  fallbackEl.innerHTML =
+    `<b>Context graph</b> — ${nodes.length} nodes, ${rels.length} relationships` +
+    `<ul>` + rels.map(r =>
+      `<li>${byId[r.from]||r.from} <i>—[${r.caption}]→</i> ${byId[r.to]||r.to}</li>`).join("") +
+    `</ul>`;
+}
+
+function addMessage(role, content, about) {
+  const wrap = document.createElement("div");
+  wrap.className = `msg ${role}`;
+  const roleEl = document.createElement("div");
+  roleEl.className = "role"; roleEl.textContent = role;
+  const bubble = document.createElement("div");
+  bubble.className = "bubble"; bubble.textContent = content;
+  wrap.appendChild(roleEl); wrap.appendChild(bubble);
+  if (role === "assistant") {
+    const fb = document.createElement("div");
+    fb.className = "fb";
+    for (const [val, icon] of [["up","👍"], ["down","👎"]]) {
+      const b = document.createElement("button");
+      b.textContent = icon;
+      b.onclick = async () => {
+        fb.querySelectorAll("button").forEach(x => x.classList.remove("on"));
+        b.classList.add("on");
+        await fetch("/chat/feedback", { method:"POST", headers:{"Content-Type":"application/json"},
+          body: JSON.stringify({ conversationId, rating: val, about: content }) });
+      };
+      fb.appendChild(b);
+    }
+    wrap.appendChild(fb);
+  }
+  messagesEl.appendChild(wrap);
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+}
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text) return;
+  $("input").value = "";
+  $("sendBtn").disabled = true;
+  addMessage("user", text);
+  const thinking = document.createElement("div");
+  thinking.className = "msg assistant"; thinking.innerHTML = '<div class="role">assistant</div><div class="bubble">…</div>';
+  messagesEl.appendChild(thinking);
+  try {
+    const res = await fetch("/chat", { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ message: text, conversationId }) });
+    const data = await res.json();
+    setConv(data.conversationId);
+    thinking.remove();
+    addMessage("assistant", data.reply);
+    renderGraph(data.viz);
+  } catch (e) {
+    thinking.querySelector(".bubble").textContent = "Error: " + e;
+  } finally {
+    $("sendBtn").disabled = false;
+    $("input").focus();
+  }
+}
+
+async function newConversation() {
+  const res = await fetch("/chat/new", { method:"POST" });
+  const data = await res.json();
+  setConv(data.conversationId);
+  messagesEl.innerHTML = "";
+  renderGraph({ nodes: [], relationships: [] });
+}
+
+async function loadExisting() {
+  if (!conversationId) { await newConversation(); return; }
+  setConv(conversationId);
+  try {
+    const hist = await (await fetch(`/chat?conversationId=${encodeURIComponent(conversationId)}`)).json();
+    messagesEl.innerHTML = "";
+    (hist.messages || []).forEach(m => addMessage(m.role, m.content));
+    const viz = await (await fetch(`/graph/context?conversationId=${encodeURIComponent(conversationId)}`)).json();
+    renderGraph(viz);
+  } catch (e) { console.warn(e); await newConversation(); }
+}
+
+$("sendBtn").onclick = send;
+$("newBtn").onclick = newConversation;
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+
+loadExisting();
+</script>
+</body>
+</html>
